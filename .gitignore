@@ -1,0 +1,13 @@
+cosmopedia/
+checkpoints/
+
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+.vscode/
+*.swp
+*.swo
