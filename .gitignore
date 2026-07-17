@@ -1,5 +1,6 @@
 cosmopedia/
 checkpoints/
+models/
 
 __pycache__/
 *.py[cod]
