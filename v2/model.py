@@ -25,14 +25,13 @@ class KdaAttention(nn.Module):
         self.norm_q = nn.LayerNorm(d_head)
         self.norm_k = nn.LayerNorm(d_head)
 
-        self.beta = nn.Linear(d_model, n_heads, bias=False)
-        self.alpha = nn.Sequential(
+        self.f_proj = nn.Sequential(
             nn.Linear(d_model, d_head, bias=False),
-            nn.Linear(d_head, proj_width, bias=False)
+            nn.Linear(d_head, proj_width)
         )
 
-        self.A_log = nn.Parameter(torch.rand(1, 1, n_heads, 1)*16, requires_grad=True)
-        self.dt_bias = nn.Parameter(torch.rand(proj_width), requires_grad=True)
+        self.b_proj = nn.Linear(d_model, n_heads, bias=False)
+        
 
     def forward(self, x):
         B, T, _ = x.shape
@@ -53,21 +52,38 @@ class KdaAttention(nn.Module):
         print(k.shape)
         print(v.shape)
 
-        b = self.beta(x).sigmoid()
-        f = self.alpha(x)
-        g = self.alpha(x)
+        f = self.f_proj(x).reshape(B, T, self.n_heads, self.d_head)
+        b = self.b_proj(x).sigmoid()
+
+        s_t = torch.zeros(B, self.n_heads, self.d_head, self.d_head)
+
+        print()
+        print(s_t.shape)
+
+        v_t = (s_t @ k[:, 0].reshape(B, self.n_heads, self.d_head, 1)).reshape(B, self.n_heads, self.d_head)
+
+        err = (v[:, 0] - v_t).reshape(B, self.n_heads, self.d_head, 1)
+        corr = err @ k[:, 0].reshape(B, self.n_heads, 1, self.d_head)
 
 
-        print(b.shape)
+        print()
+
+
+        corr = torch.mul(b[:, 0].reshape(B, self.n_heads, 1, 1), corr)
+
         print(f.shape)
-        print(g.shape)
+
+        decay = torch.mul(f[:, 0].reshape(B, self.n_heads,1, self.d_head), s_t)
+
+        s_t = corr + decay
+
+        out = s_t @ q[:, 0].reshape(B, self.n_heads, self.d_head, 1)
 
 
 
 
 
-
-attn = KdaAttention(256, 8, 32)
+attn = KdaAttention(256, 8, 64)
 
 a = torch.rand(1, 10, 256)
 
