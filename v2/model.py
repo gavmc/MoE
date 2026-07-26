@@ -10,7 +10,7 @@ class KdaAttention(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_head
 
-        proj_width = n_heads*d_head
+        proj_width = n_heads*d_head 
 
         self.wq = nn.Linear(d_model, proj_width, bias=False)
         self.wk = nn.Linear(d_model, proj_width, bias=False)
