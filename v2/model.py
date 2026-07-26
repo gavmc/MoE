@@ -22,15 +22,14 @@ class KdaAttention(nn.Module):
 
         self.silu = nn.SiLU()
 
-        self.norm_q = nn.LayerNorm(d_head)
-        self.norm_k = nn.LayerNorm(d_head)
-
         self.f_proj = nn.Sequential(
             nn.Linear(d_model, d_head, bias=False),
             nn.Linear(d_head, proj_width)
         )
 
         self.b_proj = nn.Linear(d_model, n_heads, bias=False)
+
+        self.wo = nn.Linear(proj_width, d_model, bias=True)
         
 
     def forward(self, x):
@@ -44,40 +43,34 @@ class KdaAttention(nn.Module):
         k = self.silu(self.conv_k(F.pad(k, (3, 0)))).transpose(1, 2).reshape(B, T, self.n_heads, self.d_head)
         v = self.silu(self.conv_v(F.pad(v, (3, 0)))).transpose(1, 2).reshape(B, T, self.n_heads, self.d_head)
 
-
-        q = self.norm_q(q)
-        k = self.norm_k(k)
-
-        print(q.shape)
-        print(k.shape)
-        print(v.shape)
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
 
         f = self.f_proj(x).reshape(B, T, self.n_heads, self.d_head)
+        a = torch.exp(-F.softplus(f))
         b = self.b_proj(x).sigmoid()
 
         s_t = torch.zeros(B, self.n_heads, self.d_head, self.d_head)
 
-        print()
-        print(s_t.shape)
+        out = torch.zeros(B, T, self.n_heads, self.d_head)
 
-        v_t = (s_t @ k[:, 0].reshape(B, self.n_heads, self.d_head, 1)).reshape(B, self.n_heads, self.d_head)
+        for t in range(T):
+            s_t = torch.mul(a[:, t].reshape(B, self.n_heads,1, self.d_head), s_t)
+            v_t = (s_t @ k[:, t].reshape(B, self.n_heads, self.d_head, 1)).reshape(B, self.n_heads, self.d_head)
 
-        err = (v[:, 0] - v_t).reshape(B, self.n_heads, self.d_head, 1)
-        corr = err @ k[:, 0].reshape(B, self.n_heads, 1, self.d_head)
+            err = (v[:, t] - v_t).reshape(B, self.n_heads, self.d_head, 1)
+
+            corr = err @ k[:, t].reshape(B, self.n_heads, 1, self.d_head)
+            corr = torch.mul(b[:, t].reshape(B, self.n_heads, 1, 1), corr)
+
+            s_t += corr
+
+            out[:, t] = (s_t @ q[:, t].reshape(B, self.n_heads, self.d_head, 1)).reshape(B, self.n_heads, self.d_head)
 
 
-        print()
-
-
-        corr = torch.mul(b[:, 0].reshape(B, self.n_heads, 1, 1), corr)
-
-        print(f.shape)
-
-        decay = torch.mul(f[:, 0].reshape(B, self.n_heads,1, self.d_head), s_t)
-
-        s_t = corr + decay
-
-        out = s_t @ q[:, 0].reshape(B, self.n_heads, self.d_head, 1)
+        out = self.wo(out.reshape(B, T, self.n_heads*self.d_head))
+        print(out.shape)
+        return out
 
 
 
@@ -85,6 +78,6 @@ class KdaAttention(nn.Module):
 
 attn = KdaAttention(256, 8, 64)
 
-a = torch.rand(1, 10, 256)
+inp = torch.rand(1, 10, 256)
 
-attn(a)
+attn(inp)
