@@ -92,6 +92,51 @@ class KdaAttention(nn.Module):
 
         return self.wo(o.reshape(B, T, -1)), (s, q_cache, k_cache, v_cache)
 
+
+class GatedMla(nn.Module):
+    def __init__(self, d_model, n_heads, d_head, d_kv=128):
+        super().__init__()
+
+        self.n_heads = n_heads
+        self.d_head = d_head
+
+        proj_width = n_heads * d_head
+
+        self.wq = nn.Linear(d_model, proj_width, bias=False)
+
+        self.kv_down = nn.Linear(d_model, d_kv, bias=False)
+        self.kv_norm = nn.RMSNorm(d_kv)
+        self.k_up = nn.Linear(d_kv, proj_width, bias=False)
+        self.v_up = nn.Linear(d_kv, proj_width, bias=False)
+
+        self.g_proj = nn.Linear(d_model, proj_width, bias=False)
+        self.wo = nn.Linear(proj_width, d_model, bias=False)
+
+    def forward(self, x, cache=None):
+        B, T, _ = x.shape
+        H, D = self.n_heads, self.d_head
+
+        c = self.kv_norm(self.kv_down(x))
+        if cache is not None:
+            c = torch.cat([cache, c], dim=1)
+        S = c.shape[1]
+
+        q = self.wq(x).reshape(B, T, H, D).transpose(1, 2)
+        k = self.k_up(c).reshape(B, S, H, D).transpose(1, 2)
+        v = self.v_up(c).reshape(B, S, H, D).transpose(1, 2)
+
+        if cache is None:
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            pos = torch.arange(S - T, S, device=x.device).unsqueeze(-1)
+            mask = pos >= torch.arange(S, device=x.device)
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+        o = o.transpose(1, 2).reshape(B, T, H * D)
+
+        return self.wo(torch.sigmoid(self.g_proj(x)) * o), c
+
+
 def situ_glu(g, u, b1, b2):
     gate = b1 * torch.tanh(g / b1) * torch.sigmoid(g)
     return gate * (b2 * torch.tanh(u / b2))
@@ -180,8 +225,94 @@ class MoE(nn.Module):
             counts = torch.bincount(idx.reshape(-1), minlength=self.n_routed)
             return y, counts
         return y
-        
 
-        
 
- 
+class AttnRes(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+
+        self.w = nn.Parameter(torch.zeros(d_model))
+
+    def forward(self, values, keys):
+        v = torch.stack(values, dim=2)         
+        k = torch.stack(keys, dim=2)             
+        a = (k @ self.w).softmax(-1)                 
+        return torch.einsum("btl,btld->btd", a, v), a
+
+
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads, d_head, d_kv, moe_kw, n_kda=3):
+        super().__init__()
+        self.attn = nn.ModuleList(
+            [KdaAttention(d_model, n_heads, d_head) for _ in range(n_kda)]
+            + [GatedMla(d_model, n_heads, d_head, d_kv)]
+        )
+        self.moe = nn.ModuleList(MoE(d_model, **moe_kw) for _ in range(n_kda + 1))
+        self.res_attn = nn.ModuleList(AttnRes(d_model) for _ in range(n_kda + 1))
+        self.res_moe = nn.ModuleList(AttnRes(d_model) for _ in range(n_kda + 1))
+        self.key_norm = nn.RMSNorm(d_model, elementwise_affine=False)
+
+    def _emit(self, out, values, keys):
+        values.append(out)
+        keys.append(self.key_norm(out))
+
+    def forward(self, values, keys):
+        for i in range(len(self.attn)):
+            h, _ = self.res_attn[i](values, keys)
+            out, _ = self.attn[i](h)              
+            self._emit(out, values, keys)
+
+            h, _ = self.res_moe[i](values, keys)
+            out = self.moe[i](h)                   
+            self._emit(out, values, keys)
+        return values, keys
+
+
+def emit(out, values, keys):
+    values.append(out)
+    keys.append(F.rms_norm(out, out.shape[-1:]))
+
+
+class MiniK3(nn.Module):
+    def __init__(self, vocab_size=32000, d_model=512, n_heads=8, d_head=64, d_kv=128,
+                 d_latent=256, d_ff_e=224, d_ff_s=448,
+                 n_shared=2, n_routed=32, top_k=4, n_blocks=3, n_kda=3):
+        super().__init__()
+
+        self.embedding = nn.Embedding(vocab_size, d_model)
+
+        moe_kw = dict(d_latent=d_latent, d_ff_e=d_ff_e, d_ff_s=d_ff_s,
+                      n_shared=n_shared, n_routed=n_routed, top_k=top_k)
+
+        self.blocks = nn.ModuleList(
+            [Block(d_model, n_heads, d_head, d_kv, moe_kw, n_kda) for _ in range(n_blocks)]
+            + [Block(d_model, n_heads, d_head, d_kv, moe_kw, n_kda=0)]  
+        )
+
+        self.res_out = AttnRes(d_model)
+        self.out_norm = nn.RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.embedding.weight        
+
+    def forward(self, ids):
+        h = self.embedding(ids)
+        values, keys = [h], [F.rms_norm(h, h.shape[-1:])]    
+
+        for block in self.blocks:
+            block(values, keys)                     
+
+        h, _ = self.res_out(values, keys)         
+        return self.lm_head(self.out_norm(h))
+
+
+
+model = MiniK3()
+
+num = 0
+
+for p in model.parameters():
+    num += p.numel() if p.requires_grad else 0
+
+
+print(num)
+
