@@ -252,20 +252,21 @@ class Block(nn.Module):
         self.res_moe = nn.ModuleList(AttnRes(d_model) for _ in range(n_kda + 1))
         self.key_norm = nn.RMSNorm(d_model, elementwise_affine=False)
 
-    def _emit(self, out, values, keys):
-        values.append(out)
-        keys.append(self.key_norm(out))
+    def forward(self, values, keys, state=None):
+        if state is None:
+            state = [None] * len(self.attn)
+        new_state = []
 
-    def forward(self, values, keys):
         for i in range(len(self.attn)):
             h, _ = self.res_attn[i](values, keys)
-            out, _ = self.attn[i](h)              
-            self._emit(out, values, keys)
+            out, st = self.attn[i](h, state[i])
+            new_state.append(st)
+            emit(out, values, keys)
 
             h, _ = self.res_moe[i](values, keys)
-            out = self.moe[i](h)                   
-            self._emit(out, values, keys)
-        return values, keys
+            out = self.moe[i](h)
+            emit(out, values, keys)
+        return new_state
 
 
 def emit(out, values, keys):
@@ -294,25 +295,43 @@ class MiniK3(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight        
 
-    def forward(self, ids):
+    def forward(self, ids, state=None, use_cache=False):
         h = self.embedding(ids)
-        values, keys = [h], [F.rms_norm(h, h.shape[-1:])]    
+        values, keys = [h], [F.rms_norm(h, h.shape[-1:])]
 
-        for block in self.blocks:
-            block(values, keys)                     
+        if state is None:
+            state = [None] * len(self.blocks)
+        new_state = []
 
-        h, _ = self.res_out(values, keys)         
-        return self.lm_head(self.out_norm(h))
+        for block, st in zip(self.blocks, state):
+            new_state.append(block(values, keys, st))
+
+        h, _ = self.res_out(values, keys)
+        logits = self.lm_head(self.out_norm(h))
+
+        return (logits, new_state) if use_cache else logits
+
+    @torch.no_grad()
+    def generate(self, ids, max_new_tokens, temperature=1.0):
+        logits, state = self(ids, use_cache=True)
+
+        for _ in range(max_new_tokens):
+            probs = (logits[:, -1] / temperature).softmax(-1)
+            nxt = torch.multinomial(probs, 1)
+            ids = torch.cat([ids, nxt], dim=1)
+            logits, state = self(nxt, state, use_cache=True)
+
+        return ids
 
 
+if __name__ == "__main__":
+    model = MiniK3()
 
-model = MiniK3()
+    num = 0
 
-num = 0
-
-for p in model.parameters():
-    num += p.numel() if p.requires_grad else 0
+    for p in model.parameters():
+        num += p.numel() if p.requires_grad else 0
 
 
-print(num)
+    print(num)
 
