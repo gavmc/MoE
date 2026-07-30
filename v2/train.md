@@ -59,22 +59,31 @@ Pack documents to fixed length with an EOS separator; don't pad. At 2048 tokens 
 one packed sequence is a reasonable unit for the loader to hand out.
 
 Hold out a fixed FineWeb-Edu slice — a few million tokens, never trained on — from the very first
-run. You need it for the before/after comparison in §8, and retrofitting a clean holdout after the
+run. You need it for the before/after comparison in §10, and retrofitting a clean holdout after the
 fact is not possible.
+
+**Implemented** in `prepare.py` / `loader.py`. `prepare.py` trains the BPE, packs one `uint16` shard
+per input parquet file, and records shards, token counts, `vocab_size` and the holdout list in
+`manifest.json`. Holdout is whole shards, named in the manifest — structurally disjoint, not
+sampled. `loader.py` memory-maps the shards and serves non-overlapping `seq_len+1` windows in a
+seeded permutation; resume state is the single integer `pos`.
+
+Read `vocab_size` from the manifest, never from the `MiniK3` default. BPE can land under the target
+on a small corpus, and an embedding table wider than the token range trains fine while being wrong.
 
 ---
 
 ## 3. Optimizer and schedule
 
 ```
-precision       bf16 autocast, fp32 master weights
+precision       bf16 autocast, fp32 master weights, fp32 loss
 optimizer       Muon (matrices) + AdamW (everything else)
 lr schedule     cosine decay to ~10% of peak, 1% linear warmup
-weight decay    0.1
+weight decay    0.1 on matrices, 0 on 1D
 grad clip       1.0
 seq len         2048
-tokens/step     ~32K  (batch 16 × 2048, via gradient accumulation)
-checkpointing   on
+tokens/step     32K  (micro-batch 16 if it fits, else 8 × 2 accumulation)
+checkpointing   off — see §4
 embeddings      tied
 ```
 
@@ -82,6 +91,42 @@ The report ran a dedicated scaling-law search per schedule and found **cosine be
 gets its own hyperparameters — the two have substantially different optimal peak LR and batch size,
 so a shared sweep unfairly favours one. Use cosine; you cannot afford the sweep that would justify
 anything else.
+
+### Committing the token budget
+
+Cosine needs `total_steps` up front. That is in direct tension with §1's "if it's stable at 3B and
+you can spare a day, keep going" — that is a WSD affordance, and you cannot have both. Decaying to a
+3B budget and then continuing gives you a model trained on a schedule that doesn't mean anything.
+
+**Calibrate first, commit once, don't reopen it.** The arithmetic:
+
+| | |
+|---|---|
+| Steps for 3B tokens at 32K/step | ~91,500 |
+| FLOPs per step | `6 × 63.3M × 32768 = 1.24e13` |
+| At 12 TFLOP/s effective | ~1.0 s/step → **~26 h for 3B** |
+| At 6 TFLOP/s effective | ~2.1 s/step → **~53 h for 3B** |
+| Unattended window (Thu night → late Sun) | ~72 h |
+
+So 3B fits with room, and 4B is plausible if throughput lands at the optimistic end. Measure real
+tok/s over ~200 steps at the main config, set the budget to fill **~55 hours** — leaving ~17 hours of
+slack for restarts — round it, and launch. A run that finishes Saturday is worth more than a longer
+one you had to fudge the schedule for.
+
+### Precision
+
+bf16 autocast, no `GradScaler` — bf16 has fp32's exponent range and doesn't need loss scaling.
+
+**Compute the loss in fp32.** `F.cross_entropy` over 32K classes on bf16 logits throws away
+precision for nothing; the cast is free relative to the GEMM that produced the logits.
+
+**`_chunk` needs checking before you trust it in bf16.** `k_hat = k * (-g).exp()` reaches `e^80 ≈
+5e34` by construction — that is exactly the quantity capping `C` at 16 (§5). bf16 will not overflow,
+but the whole chunkwise formulation depends on `exp(g_i)·exp(−g_j)` cancelling back to a bounded
+ratio, and doing that across 34 orders of magnitude with an 8-bit mantissa is not obviously safe.
+`solve_triangular` on `I + A` in bf16 is the same worry in a second form. See the §8 checklist for
+the test; if it fails, wrap the decay-and-solve section in `torch.autocast(enabled=False)` and cast
+`g` to fp32. Those tensors are small next to the expert GEMMs, so the cost is minor.
 
 ### Parameter groups
 
@@ -105,12 +150,37 @@ something meaningless.
 
 The 3D expert stacks are the one real trap: `w_gate` is `(32, 256, 224)`. Orthogonalizing that as a
 single 2D reshape couples all 32 experts into one update direction, which is precisely the failure
-mode Per-Head Muon exists to avoid. Loop over the expert dimension, or reshape so each expert's
-block is handled separately.
+mode Per-Head Muon exists to avoid.
+
+The fix is smaller than it looks. Newton–Schulz is all matmuls, so it already broadcasts over a
+leading batch dimension — you do **not** need a Python loop over experts. What you do need is to fix
+the normalization, which in the standard implementation is a global `X / X.norm()`:
+
+```python
+X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)   # per-slice, not global
+```
+
+That one line is the whole difference between correct per-expert orthogonalization and silently
+coupling all 32. Vendor Keller Jordan's implementation and make this change; don't write your own.
 
 **Per-Head Muon is not worth implementing.** K3 partitions attention momentum along the head
 dimension so heads with large gradient scales don't dominate. At 8 heads you will not measure the
 difference. Plain Muon on the full projection matrices is fine.
+
+### Assert the groups at startup
+
+Three of §11's live failure modes are startup-assertable, and all three are silent otherwise:
+
+```python
+assert set(map(id, muon_params)) | set(map(id, adamw_params)) == set(map(id, model.parameters()))
+assert not (set(map(id, muon_params)) & set(map(id, adamw_params)))
+assert all(p.ndim >= 2 for p in muon_params)
+```
+
+Compare by `id`, not by value — `torch.Tensor.__eq__` is elementwise and set membership on tensors
+will not do what you want. The tied `lm_head.weight` / `embedding.weight` is one object, so it must
+appear exactly once. And `router_bias`, `qb_hist`, `qb_lo`, `qb_w` are buffers, invisible to
+`model.parameters()` — that is intended; confirm they are in no group.
 
 ### Learning rate
 
@@ -142,15 +212,51 @@ Rough accounting at batch 8 × 2048, to show where the headroom is:
 | AttnRes source list | ~450 MB (27 tensors × B × T × 512, bf16) |
 | Module activations | remainder |
 
-Comfortable on 24 GB. Two notes:
+Comfortable on 24 GB. Three notes:
 
 The **AttnRes source list is the one activation cost unique to this architecture** — the `O(Ld)`
 memory the report names as the real overhead of full AttnRes. It scales linearly with batch, so it
-is the first thing to feel if you push batch size up. If it bites, gradient-checkpoint the blocks
-before you consider Block AttnRes; blocking is a multi-device optimization and buys nothing here.
+is the first thing to feel if you push batch size up. Blocked AttnRes is a multi-device optimization
+and buys nothing here.
 
 Your 64 GB of system RAM is useful for the data pipeline — tokenize and pack to memory-mapped
-`.bin` shards ahead of time so the loader never competes with training for CPU.
+`.bin` shards ahead of time so the loader never competes with training for CPU. `PackedLoader.warm()`
+touches one byte per 4 MB page to pull shards into page cache, so first-epoch timing is not
+disk-bound.
+
+### Gradient checkpointing — off, deliberately
+
+Micro-batch size, capacity headroom and checkpointing are one coupled decision. Resolve them in this
+direction: **use the largest micro-batch that fits, and leave gradient checkpointing off.**
+
+1. `Block.forward` mutates `values` / `keys` in place through `emit`. Under
+   `torch.utils.checkpoint`, the recompute pass appends a *second* time and `values` comes out the
+   wrong length — probably a shape error at `torch.stack`, possibly something quieter. Enabling
+   checkpointing means refactoring `Block.forward` to return new lists first. That is surgery on the
+   hot path days before an unattended run.
+2. The accounting above says batch 8 is already comfortable. Checkpointing buys memory you may not
+   need at roughly 30% of throughput.
+3. Larger micro-batches give capacity headroom for free.
+
+On (3) the numbers are better than they look. Capacity is computed per `dispatch` call, so a smaller
+micro-batch means a smaller `N` and a tighter bound:
+
+| micro-batch | tokens `N` | `cap` | target load | §6 noise floor | headroom |
+|---|---|---|---|---|---|
+| 4 | 8,192 | 1,280 | 1,024 | 7.8% | 3.2σ |
+| 8 | 16,384 | 2,560 | 2,048 | 5.5% | 4.5σ |
+| 16 | 32,768 | 5,120 | 4,096 | 3.9% | 6.4σ |
+
+**Capacity is not binding at any micro-batch you would plausibly use.** Keep `capacity_factor=1.25`
+and treat §5's "drop to 1.1" as an optimization you take only after `dropped` logs exactly 0 for
+thousands of steps.
+
+So: try micro-batch 16 first — 32K tokens in one forward, no accumulation at all. If it OOMs, fall
+back to 8 × 2. Keep the accumulation path either way; you need it for the control run and for any
+config change.
+
+This leaves a known landmine in `Block.forward`. It is inert as long as checkpointing stays off.
+Fix it after the main run, not before.
 
 ---
 
@@ -242,6 +348,19 @@ Beyond loss and LR. The first four come straight out of `moe_load_stats(model)`.
 - **Grad norm, pre-clip.** Spikes here precede loss spikes.
 - **Tokens/sec and effective TFLOP/s.** So you know whether the kernel work actually helped.
 
+### Two ordering rules that are easy to get backwards
+
+**Call `moe_load_stats` before the eval pass, not after.** `MoE.load` holds whatever the last
+`dispatch` call saw, so an eval forward overwrites the training statistics you meant to log. You get
+plausible numbers describing the wrong batch.
+
+**Reset the val loader to `pos=0` before each eval** so every eval scores the identical sequences.
+Otherwise the val curve carries sampling noise on top of the signal, and the §10 before/after
+comparison gets fuzzier than it needs to be. `PackedLoader` makes this a one-line assignment.
+
+Eval needs no QB special-casing: `qb_accumulate` is gated on `self.training`, so `model.eval()` is
+sufficient to keep the holdout out of the bias estimate.
+
 ### Expected `max_dev` — do not chase it to zero
 
 QB plateaus at a non-zero deviation and this is statistics, not a bug. The bias is fitted on step
@@ -269,7 +388,144 @@ moving `router.weight` to AdamW), not in QB.
 
 ---
 
-## 7. Post-training
+## 7. The run
+
+The single fact that shapes `train.py` more than anything architectural: **you launch Thursday night
+and do not touch the machine until Sunday.** ~72 unattended hours on a Windows desktop. Every design
+choice below is downstream of *this run must survive things you are not there to fix.*
+
+### Files
+
+```
+config.py   dataclass; DEBUG / MAIN / CONTROL, dumped into every checkpoint
+optim.py    param groups + vendored Muon + the §3 assertions
+train.py    takes a model factory, not MiniK3
+run.ps1     supervisor loop
+```
+
+`train.py` taking a **factory** rather than constructing `MiniK3` is worth the small awkwardness.
+§10 calls the dense control run the most interesting result the project can produce, and it needs the
+same loop, same data, same schedule, same logging, differing only in `build_model`. Hardcode the
+model and you will fork the file, and the comparison gets weaker for a reason that has nothing to do
+with the science.
+
+### Unattended operation
+
+- **Auto-resume is the default, not a flag.** `train.py --out C:\ml\runs\main` looks for
+  `ckpt_last.pt` and resumes if present. No `--resume` to forget at 2am.
+- **Supervisor loop**, not bare `python train.py` — a `.ps1` that relaunches on nonzero exit, with a
+  retry cap so a deterministic crash doesn't spin for 60 hours burning the window.
+- **Atomic checkpoints**, `.partial` → `replace()`, same as `prepare.py`. A checkpoint half-written
+  during a power blip is *worse* than no checkpoint, because auto-resume will find it and load it.
+- **Save on wall clock, not step count** — every ~20 minutes. Wall clock is what you are insuring
+  against. Keep `ckpt_last.pt` plus a numbered checkpoint every few hours; you will want
+  intermediate points for §10 and for restarting from before a late-run divergence.
+
+One property worth protecting: **there is no dropout anywhere in `model.py`**, and data order is
+fully determined by the loader's `pos`. Resume is therefore bit-exact without saving RNG state.
+Don't add dropout casually.
+
+### Checkpoint contract
+
+```
+step, tokens_seen
+model.state_dict()          # router_bias is persistent — included ✓
+muon.state_dict(), adamw.state_dict()
+train_loader.state_dict()   # pos / seed / paths
+config dict, vocab_size from the manifest
+```
+
+One subtlety: `qb_hist`, `qb_tokens`, `qb_lo`, `qb_w` are `persistent=False`, so they are absent from
+the checkpoint and return at `__init__` defaults. The defaults are reasonable, but **call
+`qb_reset()` on every `MoE` immediately after loading** so the histogram range is derived from the
+restored `router_bias` the way it would be in steady state. One line; removes a behavioural
+difference between a resumed run and a continuous one.
+
+### Logging
+
+JSONL to disk, one object per line, flushed on write. Two record types:
+
+- **light**, every ~20 steps: `step, tokens, loss, lr_muon, lr_adamw, grad_norm, tok_s, mem_gb`
+- **heavy**, every ~500 steps: `moe_load_stats(model)`, val loss, AttnRes entropy, α range
+
+Flat JSONL because it survives a `kill -9` mid-write with at most one corrupt trailing line, needs
+no daemon, and works offline. You will be reading these files a day after they were written, not
+watching a dashboard.
+
+### `torch.compile` — off
+
+`_chunk`'s Python loop over `N`, the buffer mutation in `qb_accumulate`, `index_add_`, and the
+`T < 32` branch are all graph-break or recompile sources. A recompilation storm 40 hours into an
+unattended run is a bad way to lose a weekend. Measure it during calibration; if it is a clean 1.3×+
+and stable over 500 steps, reconsider. **The run must not depend on it.**
+
+---
+
+## 8. Pre-flight — what to check, in order
+
+Everything here is cheap. Every item corresponds to a failure mode in §11 that is silent otherwise.
+`train.py --dry-run` should do items 4–8 in one command and exit, so it doubles as the calibration
+tool.
+
+**This week, while you still have internet**
+
+1. **Download the corpora.** Set `HF_HOME` outside OneDrive first.
+   ```
+   set HF_HOME=C:\ml\hf
+   huggingface-cli download HuggingFaceFW/fineweb-edu --repo-type dataset ^
+       --include "sample/10BT/*" --local-dir C:\ml\raw\fineweb-edu
+   huggingface-cli download roneneldan/TinyStories --repo-type dataset --local-dir C:\ml\raw\tinystories
+   huggingface-cli download HuggingFaceTB/smol-smoltalk --repo-type dataset --local-dir C:\ml\raw\smoltalk
+   ```
+   Check the repo file listing before trusting the `--include` glob. `prepare.py` only needs a
+   directory with `.parquet` somewhere beneath it.
+
+2. **Pack the corpus.** CPU-only, so run it remotely and leave the GPU free.
+   ```
+   python prepare.py --source C:\ml\raw\fineweb-edu --out C:\ml\data --limit-files 2   # smoke test
+   python prepare.py --source C:\ml\raw\fineweb-edu --out C:\ml\data                   # full
+   python prepare.py --source C:\ml\raw\tinystories --out C:\ml\data-debug
+   ```
+   Budget ~27 GB download, 10–20 min tokenizer, 1–2 h packing, ~47 GB peak disk falling to 20 GB
+   once you delete the parquet.
+
+3. **Verify the data.** `python loader.py --data C:\ml\data --seq-len 2048` — confirm `shift ok`,
+   `in range`, a readable decoded sample, and that the holdout file list is non-empty. This is your
+   data gate; §11's "holdout accidentally inside the training shards" dies here.
+
+**Thursday, on the desktop, before launching**
+
+4. **Step-0 loss ≈ `ln(vocab)`.** `ln(32000) = 10.373`. The last measured value was 10.480. Anything
+   near 16× that means the tied-embedding init regressed. Cheapest check in the document.
+
+5. **Parameter-group table.** Print it and read it. Run the three §3 assertions. Confirm the 3D
+   expert stacks are getting per-slice normalization, not global.
+
+6. **bf16 vs fp32 in `_chunk`.** Run one batch through `_chunk` in fp32 and under bf16 autocast and
+   compare relative error against the fp64 reference. Clean → do nothing. Not clean → force fp32 on
+   the decay-and-solve section per §3.
+
+7. **Memory and throughput.** Micro-batch 16 first, then 8 if it OOMs. Record peak GB and tok/s over
+   ~200 steps. This is the number that sets the budget.
+
+8. **Commit the budget.** `total_steps` such that the run fills ~55 hours at the measured tok/s.
+   Write it into the config. Do not plan to extend it.
+
+9. **Crash-resume drill.** Run 100 steps, kill the process, relaunch, confirm the loss curve is
+   continuous across the seam and `tokens_seen` picks up where it left off. **Do not skip this** —
+   auto-resume is the mechanism the whole weekend depends on, and the only way to know it works is to
+   break the run on purpose while you are standing there.
+
+10. **Windows hygiene.** Pause Windows Update. `powercfg /change standby-timeout-ac 0` and
+    `/hibernate-timeout-ac 0`. Confirm `C:\ml\runs\` and `C:\ml\data\` are outside OneDrive — a sync
+    client dehydrating a shard mid-run, with no internet to rehydrate it, ends the run.
+
+11. **Launch through `run.ps1`**, not `python train.py`. Watch the first 200 steps, confirm the JSONL
+    is being written and `max_dev` is falling, then leave.
+
+---
+
+## 9. Post-training
 
 Be realistic about what 63M active parameters can do. It will not be a general assistant, it cannot
 do multi-step reasoning, and chat-style RLHF at this scale mostly teaches fluent hallucination. What
@@ -311,7 +567,7 @@ degrade fluency, and you want to be able to compare.
 
 ---
 
-## 8. Evaluation
+## 10. Evaluation
 
 Measure enough that claims about the model are defensible rather than descriptive.
 
@@ -335,7 +591,7 @@ result nobody can get from reading the paper.
 
 ---
 
-## 9. Training-specific failure modes
+## 11. Training-specific failure modes
 
 None of these crash. All of them waste the run.
 
@@ -351,37 +607,78 @@ Now structurally prevented in `model.py` — listed so you know not to re-introd
       loss ~16× `ln(vocab)`, with "copy the current token" as the nearest escape. Now `std=0.02`,
       which puts step 0 at a uniform predictor
 
+Also structurally prevented, in the data pipeline:
+
+- [x] ~~No held-out split reserved before the first run~~ — `prepare.py` reserves whole shards and
+      names them in the manifest before any training happens
+- [x] ~~Holdout accidentally inside the training shards~~ — `make_loaders` builds the train list by
+      *excluding* the manifest's holdout names, so the two cannot overlap by construction
+- [x] ~~Truncated shard from an interrupted pack~~ — `.partial` → `replace()`, so a killed
+      `prepare.py` leaves no file that looks valid
+
 Still live:
 
 - [ ] `capacity_factor` too tight for an unconverged router — silent token dropping. Watch
-      `dropped`; keep 1.25 until QB settles, then 1.1
+      `dropped`; keep 1.25 (§4 shows it is ≥3σ at any usable micro-batch) and only tighten on evidence
 - [ ] Under DDP, QB histogram not all-reduced — `qb_step` handles it, but only if you call it on
       every rank. Do not let `broadcast_buffers` mask a missing call
-- [ ] Muon applied to 1D parameters, or to the expert stack as one coupled matrix
+- [ ] Muon applied to 1D parameters, or to the expert stack as one coupled matrix — the global
+      `X.norm()` in the stock implementation is exactly this bug (§3)
 - [ ] Muon applied to the QB buffers — `router_bias`, `qb_hist` etc. are buffers, not parameters, so
       they are invisible to `model.parameters()`. Confirm your param groups still cover everything
 - [ ] `values` list truncated because a block's return value was dropped — trains, sees fewer sources
 - [ ] `(y, cache)` tuple appended to `values` as a source — fails at `stack`, but only after a wasted run
-- [ ] No held-out split reserved before the first run — no defensible before/after later
-- [ ] Holdout accidentally inside the training shards — perplexity looks great, means nothing
 - [ ] Grad accumulation without scaling the loss by accumulation steps — effective LR is wrong by that factor
 - [ ] Initial loss not checked against `ln(vocab)` on step 0 — the cheapest possible sanity check and
       it catches init bugs before they cost you a day
+- [ ] **Gradient checkpointing enabled without fixing `Block.forward`** — `emit` mutates `values` /
+      `keys` in place, so the recompute pass double-appends. Inert while checkpointing is off (§4);
+      becomes a hard failure the moment anyone turns it on
+- [ ] **`vocab_size` taken from the `MiniK3` default instead of the manifest** — trains happily with a
+      wrong-width embedding table
+- [ ] **`moe_load_stats` called after the eval pass** — `MoE.load` has been overwritten; you log
+      plausible numbers about the wrong batch (§6)
+- [ ] **`qb_reset()` not called after loading a checkpoint** — the non-persistent histogram buffers
+      come back at `__init__` defaults instead of being derived from the restored bias (§7)
+- [ ] **Run directory or data on OneDrive** — sync dehydrates a shard mid-run and there is no
+      internet to rehydrate it
+- [ ] **Auto-resume never tested** — it is the mechanism the entire unattended weekend depends on,
+      and an untested recovery path is not a recovery path (§8 item 9)
 
 ---
 
-## 10. Order of operations
+## 12. Order of operations
 
-1. Phase gates 0–4 pass at the debug config (`structure.md §5`)
-2. ~~Chunkwise KDA verified against the reference loop~~ — done, 2e-16
-3. ~~QB update wired~~ — done; confirm load balance settles near the §6 floor on real data
-4. LR sweep at debug config, a few hundred steps per point
-5. Tokenizer trained, corpus packed to mmap shards, holdout split reserved
-6. Dense control run — same active params, same data, same budget
-7. Main run, 2–4B tokens
-8. SFT on smol-smoltalk, with effort tags
-9. Optional DPO
-10. Evaluation table: base vs. SFT vs. control
+**Done**
 
-Steps 2 and 3 were verified on synthetic data. Re-check both once real data is flowing — QB's
-behaviour depends on the router's score distribution, which random inputs do not represent.
+- [x] Chunkwise KDA verified against the reference loop — 2e-16
+- [x] Capacity-based MoE dispatch — 5.2×, exact against `_dispatch_loop`
+- [x] QB update wired — confirm load balance settles near the §6 floor once real data is flowing
+- [x] Embedding init — step-0 loss 10.480 vs `ln(32000) = 10.373`
+- [x] `prepare.py` / `loader.py` — resume, holdout isolation and atomic writes verified
+
+**This week, online**
+
+- [ ] Download FineWeb-Edu / TinyStories / smol-smoltalk (§8 item 1)
+- [ ] Pack the corpus and the debug corpus (§8 item 2)
+- [ ] Data gate: `loader.py` self-check (§8 item 3)
+- [ ] Write `config.py`, `optim.py`, `train.py`, `run.ps1`
+- [ ] Phase gates 0–4 at the debug config (`structure.md §5`)
+- [ ] LR sweep at the debug config on TinyStories — Muon over `{0.01, 0.02, 0.04}`, a few hundred
+      steps per point. Two hours, and the highest-leverage tuning available
+
+**Thursday**
+
+- [ ] Pre-flight items 4–11 (§8)
+- [ ] Launch the main run
+
+**The following week**
+
+- [ ] Dense control run — same active params, tokenizer, data and budget
+- [ ] SFT on smol-smoltalk, with effort tags
+- [ ] Optional DPO
+- [ ] Evaluation table: base vs. SFT vs. control
+
+QB and the chunkwise KDA were verified on synthetic data. Re-check both once real data is flowing —
+QB's behaviour depends on the router's score distribution, and random inputs do not represent it.
+The saturation failure mode in §6 was *only* visible with a realistic router.
