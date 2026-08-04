@@ -477,7 +477,7 @@ class MiniK3(nn.Module):
         for block, st in zip(self.blocks, state):
             if ckpt:
                 values, keys = _checkpoint_block(block, values, keys)
-                new_state.append(None)     # decode never takes this path
+                new_state.append(None)
                 continue
             values, keys, st_new = block(values, keys, st)
             new_state.append(st_new)
