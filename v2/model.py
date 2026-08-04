@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import torch.utils.checkpoint
 import math
 
 
@@ -252,7 +253,8 @@ class MoE(nn.Module):
 
     def _dispatch_loop(self, latent, idx, w):
         N, _ = latent.shape
-        out = torch.zeros_like(latent)
+        out = torch.zeros(latent.shape, device=latent.device,
+                          dtype=torch.promote_types(latent.dtype, w.dtype))
 
         flat_e = idx.reshape(-1)
         flat_w = w.reshape(-1)
@@ -291,20 +293,23 @@ class MoE(nn.Module):
         rank = torch.arange(flat_e.numel(), device=latent.device) - offsets[sorted_e]
 
         keep = rank < cap
-        slot = (sorted_e * cap + rank)[keep]
-        src = flat_t[order][keep]
+        trash = E * cap
+        slot = torch.where(keep, sorted_e * cap + rank, trash)
+        src = flat_t[order]
         self.n_dropped = (~keep).sum().detach()
         self.load = counts.detach()
 
-        buf = latent.new_zeros(E * cap, d_latent)
+        buf = latent.new_zeros(trash + 1, d_latent)
         buf[slot] = latent[src]
-        buf = buf.view(E, cap, d_latent)
+        buf = buf[:trash].view(E, cap, d_latent)
 
         h = situ_glu(buf @ self.w_gate, buf @ self.w_up, self.b1, self.b2)
-        y = (h @ self.w_down).reshape(E * cap, d_latent)
+        y = (h @ self.w_down).reshape(trash, d_latent)
 
-        out = torch.zeros_like(latent)
-        out.index_add_(0, src, y[slot] * flat_w[order][keep].unsqueeze(-1))
+        gathered = y[slot.clamp(max=trash - 1)]
+        contrib = gathered * (flat_w[order] * keep.to(flat_w.dtype)).unsqueeze(-1)
+        out = torch.zeros(latent.shape, dtype=contrib.dtype, device=latent.device)
+        out.index_add_(0, src, contrib)
         return out
 
     def route(self, xf):
@@ -381,11 +386,18 @@ class AttnRes(nn.Module):
 
         self.w = nn.Parameter(torch.zeros(d_model))
 
-    def forward(self, values, keys):
-        v = torch.stack(values, dim=2)         
-        k = torch.stack(keys, dim=2)             
-        a = (k @ self.w).softmax(-1)                 
+    def _forward_stack(self, values, keys):
+        v = torch.stack(values, dim=2)
+        k = torch.stack(keys, dim=2)
+        a = (k @ self.w).softmax(-1)
         return torch.einsum("btl,btld->btd", a, v), a
+
+    def forward(self, values, keys):
+        a = torch.stack([k @ self.w for k in keys], dim=-1).softmax(-1)
+        out = values[0] * a[..., 0:1]
+        for l in range(1, len(values)):
+            out = out + values[l] * a[..., l:l + 1]
+        return out, a
 
 class Block(nn.Module):
     def __init__(self, d_model, n_heads, d_head, d_kv, moe_kw, n_kda=3):
@@ -400,6 +412,8 @@ class Block(nn.Module):
         self.key_norm = nn.RMSNorm(d_model, elementwise_affine=False)
 
     def forward(self, values, keys, state=None):
+        values, keys = list(values), list(keys)
+
         if state is None:
             state = [None] * len(self.attn)
         new_state = []
@@ -413,7 +427,19 @@ class Block(nn.Module):
             h, _ = self.res_moe[i](values, keys)
             out = self.moe[i](h)
             emit(out, values, keys)
-        return new_state
+        return values, keys, new_state
+
+def _checkpoint_block(block, values, keys):
+    n = len(values)
+
+    def run(*tensors):
+        v, k, _ = block(list(tensors[:n]), list(tensors[n:]), None)
+        return tuple(v) + tuple(k)
+
+    out = torch.utils.checkpoint.checkpoint(run, *values, *keys, use_reentrant=False)
+    m = len(out) // 2
+    return list(out[:m]), list(out[m:])
+
 
 class MiniK3(nn.Module):
     def __init__(self, vocab_size=32000, d_model=512, n_heads=8, d_head=64, d_kv=128,
@@ -435,7 +461,9 @@ class MiniK3(nn.Module):
         self.res_out = AttnRes(d_model)
         self.out_norm = nn.RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-        self.lm_head.weight = self.embedding.weight        
+        self.lm_head.weight = self.embedding.weight
+
+        self.grad_checkpoint = False
 
     def forward(self, ids, state=None, use_cache=False):
         h = self.embedding(ids)
@@ -445,8 +473,14 @@ class MiniK3(nn.Module):
             state = [None] * len(self.blocks)
         new_state = []
 
+        ckpt = self.grad_checkpoint and self.training and not use_cache
         for block, st in zip(self.blocks, state):
-            new_state.append(block(values, keys, st))
+            if ckpt:
+                values, keys = _checkpoint_block(block, values, keys)
+                new_state.append(None)     # decode never takes this path
+                continue
+            values, keys, st_new = block(values, keys, st)
+            new_state.append(st_new)
 
         h, _ = self.res_out(values, keys)
         logits = self.lm_head(self.out_norm(h))
