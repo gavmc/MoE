@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch._dynamo
 from torch.utils.checkpoint import checkpoint
-import math
 
 from fla.ops.kda import chunk_kda
 from fla.modules import FusedLinearCrossEntropyLoss
@@ -12,8 +11,6 @@ from fla.modules.conv import ShortConvolution
 
 torch._dynamo.config.recompile_limit = 64
 
-def swish(x):
-    return x * torch.sigmoid(x)
 
 def situ_glu(x, w_gate, w_up, b1=4.0, b2=25.0):
     g = w_gate(x)
