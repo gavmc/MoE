@@ -1,10 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch._dynamo
+from torch.utils.checkpoint import checkpoint
 import math
 
 from fla.ops.kda import chunk_kda
+from fla.modules import FusedLinearCrossEntropyLoss
+from fla.modules.conv import ShortConvolution
 
+
+torch._dynamo.config.recompile_limit = 64
 
 def swish(x):
     return x * torch.sigmoid(x)
@@ -14,6 +20,18 @@ def situ_glu(x, w_gate, w_up, b1=4.0, b2=25.0):
     gate = b1 * torch.tanh(g / b1) * torch.sigmoid(g)
     up = b2 * torch.tanh(w_up(x) / b2)
     return gate * up
+
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
+        self.eps = eps
+
+    def forward(self, x):
+        dt = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
+        return (x * self.weight).to(dt)
 
 class KDA(nn.Module):
     def __init__(self, d_model, n_head, d_k, d_v, g_min=-5, chunk=16, a_rank=None):
@@ -33,10 +51,14 @@ class KDA(nn.Module):
         self.k_proj = nn.Linear(d_model, self.k_width, bias=False)
         self.v_proj = nn.Linear(d_model, self.v_width, bias=False)
  
-        self.q_conv = nn.Conv1d(self.k_width, self.k_width, kernel_size=4, stride=1, groups=self.k_width)
-        self.k_conv = nn.Conv1d(self.k_width, self.k_width, kernel_size=4, stride=1, groups=self.k_width)
-        self.v_conv = nn.Conv1d(self.v_width, self.v_width, kernel_size=4, stride=1, groups=self.v_width)
- 
+        #self.q_conv = nn.Conv1d(self.k_width, self.k_width, kernel_size=4, stride=1, groups=self.k_width)
+        #self.k_conv = nn.Conv1d(self.k_width, self.k_width, kernel_size=4, stride=1, groups=self.k_width)
+        #self.v_conv = nn.Conv1d(self.v_width, self.v_width, kernel_size=4, stride=1, groups=self.v_width)
+
+        self.q_conv = ShortConvolution(self.k_width, kernel_size=4)
+        self.k_conv = ShortConvolution(self.k_width, kernel_size=4)
+        self.v_conv = ShortConvolution(self.v_width, kernel_size=4)
+
         self.b_proj = nn.Linear(d_model, n_head, bias=False)
         a_rank = a_rank or d_k
         self.a_proj = nn.Sequential(
@@ -46,7 +68,7 @@ class KDA(nn.Module):
  
         self.a_log = nn.Parameter(torch.zeros(n_head))
  
-        self.o_norm = nn.RMSNorm(d_v)
+        self.o_norm = RMSNorm(d_v)
         self.g_proj = nn.Linear(d_model, self.v_width, bias=False)
         self.o_proj = nn.Linear(self.v_width, d_model, bias=False)
  
@@ -107,17 +129,13 @@ class KDA(nn.Module):
         B, T, _ = x.shape
         H, Dk, Dv = self.n_head, self.d_k, self.d_v
  
-        q = self.q_proj(x).permute(0, 2, 1)
-        k = self.k_proj(x).permute(0, 2, 1)
-        v = self.v_proj(x).permute(0, 2, 1)
- 
-        q = self.q_conv(F.pad(q, (3, 0))).permute(0, 2, 1).reshape(B, T, H, Dk)
-        k = self.k_conv(F.pad(k, (3, 0))).permute(0, 2, 1).reshape(B, T, H, Dk)
-        v = self.v_conv(F.pad(v, (3, 0))).permute(0, 2, 1).reshape(B, T, H, Dv)
- 
-        q = F.normalize(swish(q), p=2, dim=-1)
-        k = F.normalize(swish(k), p=2, dim=-1)
-        v = swish(v)
+        q, _ = self.q_conv(self.q_proj(x))
+        k, _ = self.k_conv(self.k_proj(x))
+        v, _ = self.v_conv(self.v_proj(x))
+
+        q = q.reshape(B, T, H, Dk)
+        k = k.reshape(B, T, H, Dk)
+        v = v.reshape(B, T, H, Dv)
  
         beta = self.b_proj(x).sigmoid()
         z = self.a_proj(x).reshape(B, T, H, Dk)
@@ -125,7 +143,7 @@ class KDA(nn.Module):
         g = self.g_min * F.sigmoid(self.a_log.exp().view(1, 1, -1, 1) * z)
 
         #o = self._chunk(q, k, v, beta, g)
-        o, _ = chunk_kda(q, k, v, g, beta, scale=1.0)
+        o, _ = chunk_kda(q, k, v, g, beta, scale=1.0, use_qk_l2norm_in_kernel=True)
         o = self.o_norm(o).reshape(B, T, self.v_width)
         return self.o_proj(self.g_proj(x).sigmoid() * o)
 
@@ -142,7 +160,7 @@ class MLA(nn.Module):
 
         self.q_proj = nn.Linear(d_model, self.width, bias=False)
         self.c_proj = nn.Linear(d_model, d_c, bias=False)
-        self.c_norm = nn.RMSNorm(d_c)
+        self.c_norm = RMSNorm(d_c)
 
         self.k_proj = nn.Linear(d_c, self.width, bias=False)
         self.v_proj = nn.Linear(d_c, self.width, bias=False)
@@ -182,45 +200,119 @@ class FFN(nn.Module):
     def forward(self, x):
         return self.w_down(situ_glu(x, self.w_gate, self.w_up, self.b1, self.b2))
 
+class MoE(nn.Module):
+    def __init__(self, d_model, d_latent, d_expert, d_shared,
+                 n_experts=16, top_k=2, bias_lr=1e-3):
+        super().__init__()
+        self.n_experts, self.top_k, self.bias_lr = n_experts, top_k, bias_lr
+
+        self.shared = FFN(d_model, d_shared)              
+        self.w_down = nn.Linear(d_model, d_latent, bias=False)
+        self.w_up   = nn.Linear(d_latent, d_model, bias=False)
+        self.u_norm = RMSNorm(d_latent) 
+
+        self.router = nn.Linear(d_model, n_experts, bias=False)
+        self.register_buffer('r_bias', torch.zeros(n_experts))
+
+        self.e_gate = nn.Parameter(torch.empty(n_experts, d_latent, d_expert))
+        self.e_up   = nn.Parameter(torch.empty(n_experts, d_latent, d_expert))
+        self.e_down = nn.Parameter(torch.empty(n_experts, d_expert, d_latent))
+
+        for w in (self.e_gate, self.e_up, self.e_down):
+            nn.init.normal_(w, std=0.02)
+
+    @torch.compiler.disable          
+    def _route_experts(self, z, idx, p):
+        N, l = z.shape
+        k = self.top_k
+        flat_e = idx.reshape(-1)              
+        order = flat_e.argsort()
+        tok = order // k 
+        counts = torch.bincount(flat_e, minlength=self.n_experts)
+
+        zs = z[tok]
+        self.last_counts = counts
+        out = torch.empty_like(zs)
+        start = 0
+        for e, c in enumerate(counts.tolist()): 
+            if c == 0:
+                continue
+            seg = zs[start:start + c]
+            g = seg @ self.e_gate[e]
+            h = (4.0 * torch.tanh(g / 4.0) * g.sigmoid()) * \
+                (25.0 * torch.tanh(seg @ self.e_up[e] / 25.0))
+            out[start:start + c] = h @ self.e_down[e]
+            start += c
+
+        u = z.new_zeros(N, l)
+        u.index_add_(0, tok, (out * p.reshape(-1)[order, None]).to(u.dtype))
+        return u, counts
+
+    def forward(self, x):
+        B, T, D = x.shape
+        flat = x.reshape(-1, D)
+
+        s = torch.sigmoid(self.router(flat))     
+        _, idx = torch.topk(s + self.r_bias, self.top_k)  
+        p = s.gather(-1, idx)
+        p = p / p.sum(-1, keepdim=True) 
+
+        u, counts = self._route_experts(self.w_down(flat), idx, p)
+
+        y = self.shared(x) + self.w_up(self.u_norm(u)).reshape(B, T, D)
+        return y
+
+    @torch.no_grad()  # <--------------------------- NEED TO REMEMBER TO CALL IN OPTIMIZER STEP
+    def update_bias(self):
+        c = self.last_counts.float()
+        err = c / c.sum() - 1.0 / self.n_experts
+        self.r_bias -= self.bias_lr * err.sign()
+
 class AttnRes(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, d_model, eps=1e-5):
         super().__init__()
         self.w = nn.Parameter(torch.zeros(d_model))
-        self.k_norm = nn.RMSNorm(d_model, elementwise_affine=False)
+        self.eps = eps
 
-    def forward(self, outputs):             
-        V = torch.stack(outputs, dim=2)    
-        K = self.k_norm(V)                   
-        scores = K @ self.w                 
-        alpha = scores.softmax(dim=-1)       
-        return (alpha.unsqueeze(-1) * V).sum(dim=2) 
+    def forward(self, outputs):
+        scores = torch.stack([
+            (v @ self.w) * torch.rsqrt(v.square().mean(-1) + self.eps)
+            for v in outputs], dim=-1)
+        alpha = scores.softmax(dim=-1)
+        out = outputs[0] * alpha[..., 0:1]
+        for i in range(1, len(outputs)):
+            out = out + outputs[i] * alpha[..., i:i + 1]
+        return out
 
 
 class MiniK3(nn.Module):
-    def __init__(self, d_model, n_head, d_head, d_k, d_v, d_c, d_ff, mix_ratio=4, layers=16, vocab_size=32_000, tie_embeddings=True):
+    def __init__(self, d_model, n_head, d_head, d_k, d_v, d_c, d_latent, d_expert, d_shared, mix_ratio=4, layers=16, vocab_size=32_000, tie_embeddings=True, use_ckpt=False):
         super().__init__()
 
         self.layers = layers
+        self.use_ckpt = use_ckpt
         self.embedding = nn.Embedding(vocab_size, d_model)
 
         self.mixers = nn.ModuleList(
-            MLA(d_model, d_c, n_head, d_head) if (i + 1) % 4 == 0
+            MLA(d_model, d_c, n_head, d_head) if (i + 1) % mix_ratio == 0
             else KDA(d_model, n_head, d_k, d_v)
             for i in range(layers)
         )
-        self.ffn = nn.ModuleList(FFN(d_model, d_ff) for _ in range(layers))
+        self.moe = nn.ModuleList(MoE(d_model, d_latent, d_expert, d_shared) if i != 0 else FFN(d_model, d_shared) for i in range(layers))
         self.attn_res = nn.ModuleList(AttnRes(d_model) for _ in range(2 * layers + 1))
 
-        self.norm_mix = nn.ModuleList(nn.RMSNorm(d_model) for _ in range(layers))
-        self.norm_ff = nn.ModuleList(nn.RMSNorm(d_model) for _ in range(layers))
+        self.norm_mix = nn.ModuleList(RMSNorm(d_model) for _ in range(layers))
+        self.norm_ff = nn.ModuleList(RMSNorm(d_model) for _ in range(layers))
 
-        self.norm_out = nn.RMSNorm(d_model)
+        self.norm_out = RMSNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
         if tie_embeddings:
             self.head.weight = self.embedding.weight
 
-            self.apply(self._init)
+        self.loss = FusedLinearCrossEntropyLoss(num_chunks=8)
+
+        self.apply(self._init)
 
     def _init(self, m):
         if isinstance(m, nn.Linear):
@@ -231,60 +323,30 @@ class MiniK3(nn.Module):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, tgt=None):
+        ckpt = (lambda f, t: checkpoint(f, t, use_reentrant=False)) if self.use_ckpt else (lambda f, t: f(t))
+
         pool = [self.embedding(idx)]
 
         for l in range(self.layers):
             h = self.attn_res[2*l](pool)
-            pool.append(self.mixers[l](self.norm_mix[l](h)))
+            pool.append(ckpt(lambda t, m=self.mixers[l], n=self.norm_mix[l]: m(n(t)), h))
 
             h = self.attn_res[2*l + 1](pool)
-            pool.append(self.ffn[l](self.norm_mix[l](h)))
+            pool.append(ckpt(lambda t, m=self.moe[l], n=self.norm_ff[l]: m(n(t)), h))
 
         x = self.attn_res[-1](pool)
-        logits = self.head(self.norm_out(x))
+        x = self.norm_out(x)
 
         if tgt is None:
-            return logits, None
+            return self.head(x), None
 
-        loss = F.cross_entropy(
-            logits[:, :-1].reshape(-1, logits.size(-1)).float(),
-            tgt[:, 1:].reshape(-1),
+        loss = self.loss(
+            x[:, :-1].contiguous(), 
+            tgt[:, 1:].contiguous(),
+            self.head.weight,
         )
-        return logits, loss
+
+        return None, loss
 
         
 
-
-
-
-device = 'cuda'
-
-
-
-torch.set_float32_matmul_precision('high')
-
-model=MiniK3(
-    d_model=1024,
-    n_head=32,
-    d_head=64,
-    d_k=64,
-    d_v=64,
-    d_c=64,
-    d_ff=2084,
-).to(device)
-
-
-r = torch.arange(0, 2048).reshape(1, 2048).to(device)
-
-import time
-
-print("-")
-start = time.perf_counter()
-log, _ = model(r)
-print(time.perf_counter()-start)
-
-num = 0
-for p in model.parameters():
-    num += p.numel() if p.requires_grad else 0
-
-print(num)
