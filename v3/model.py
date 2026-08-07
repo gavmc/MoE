@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from fla.ops.kda import chunk_kda
 
 
 class Swish(nn.Module):
@@ -37,6 +38,10 @@ class KDA(nn.Module):
         )
 
         self.a_log = nn.Parameter(torch.zeros(n_head))
+
+        self.o_norm = nn.RMSNorm(d_head)
+        self.g_proj = nn.Linear(d_model, self.proj_width, bias=False)
+        self.o_proj = nn.Linear(self.proj_width, d_model, bias=False)
 
 
     def _chunk(self, q, k, v, beta, g):
@@ -93,7 +98,7 @@ class KDA(nn.Module):
 
     def forward(self, x):
         B, T, _ = x.shape
-        H, D, _ = self.n_head, self.d_head, self.proj_width
+        H, D, P = self.n_head, self.d_head, self.proj_width
 
         q = self.q_proj(x).permute(0, 2, 1)
         k = self.k_proj(x).permute(0, 2, 1)
@@ -112,19 +117,25 @@ class KDA(nn.Module):
 
         g = self.g_min*F.sigmoid(self.a_log.exp().view(1, 1, -1, 1) * z)
 
-        return self._chunk(q, k, v, beta, g)
+        #return self._chunk(q, k, v, beta, g)
+
+        o, _ = chunk_kda(q, k, v, g, beta, scale=1.0)
+        o = self.o_norm(o).reshape(B, T, P)
+        return self.o_proj(self.g_proj(x).sigmoid() * o)
 
 
 
+
+device = 'cuda'
 
 model = KDA(
     d_model=256,
     n_head=8,
     d_head=64,
     g_min=-5
-)
+).to(device)
 
 
-r = torch.rand(1, 32, 256)
+r = torch.rand(1, 32, 256, device=device)
 
-model(r)
+print(model(r).shape)
