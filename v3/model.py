@@ -199,9 +199,10 @@ class FFN(nn.Module):
 
 class MoE(nn.Module):
     def __init__(self, d_model, d_latent, d_expert, d_shared,
-                 n_experts=16, top_k=2, bias_lr=1e-3):
+                 n_experts=16, top_k=2, bias_lr=1e-3, cap_factor=1.5):
         super().__init__()
         self.n_experts, self.top_k, self.bias_lr = n_experts, top_k, bias_lr
+        self.cap_factor = cap_factor
 
         self.shared = FFN(d_model, d_shared)              
         self.w_down = nn.Linear(d_model, d_latent, bias=False)
@@ -218,31 +219,36 @@ class MoE(nn.Module):
         for w in (self.e_gate, self.e_up, self.e_down):
             nn.init.normal_(w, std=0.02)
 
-    @torch.compiler.disable          
     def _route_experts(self, z, idx, p):
         N, l = z.shape
-        k = self.top_k
-        flat_e = idx.reshape(-1)              
-        order = flat_e.argsort()
-        tok = order // k 
-        counts = torch.bincount(flat_e, minlength=self.n_experts)
+        E, k = self.n_experts, self.top_k
+        C = max(1, int(N * k / E * self.cap_factor))
 
-        zs = z[tok]
-        self.last_counts = counts
-        out = torch.empty_like(zs)
-        start = 0
-        for e, c in enumerate(counts.tolist()): 
-            if c == 0:
-                continue
-            seg = zs[start:start + c]
-            g = seg @ self.e_gate[e]
-            h = (4.0 * torch.tanh(g / 4.0) * g.sigmoid()) * \
-                (25.0 * torch.tanh(seg @ self.e_up[e] / 25.0))
-            out[start:start + c] = h @ self.e_down[e]
-            start += c
+        flat_e = idx.reshape(-1)                 
+        order = flat_e.argsort(stable=True)
+        tok = order // k                                    
+        sorted_e = flat_e[order]
+        counts = torch.bincount(flat_e, minlength=E)
+        offset = counts.cumsum(0) - counts              
+        rank = torch.arange(N * k, device=z.device) - offset[sorted_e]
 
+        in_cap = rank < C
+        dest = sorted_e * (C + 1) + rank.clamp(max=C)        
+
+        buf = z.new_zeros(E * (C + 1), l)
+        buf.index_copy_(0, dest, z[tok])
+        buf = buf.view(E, C + 1, l)
+
+        g = torch.bmm(buf, self.e_gate)
+        h = (4.0 * torch.tanh(g / 4.0) * g.sigmoid()) * \
+            (25.0 * torch.tanh(torch.bmm(buf, self.e_up) / 25.0))
+        out = torch.bmm(h, self.e_down).reshape(E * (C + 1), l)
+
+        w = p.reshape(-1)[order] * in_cap            
         u = z.new_zeros(N, l)
-        u.index_add_(0, tok, (out * p.reshape(-1)[order, None]).to(u.dtype))
+        u.index_add_(0, tok, (out[dest] * w[:, None]).to(u.dtype))
+
+        self.last_counts = counts.detach()
         return u, counts
 
     def forward(self, x):
@@ -283,11 +289,12 @@ class AttnRes(nn.Module):
 
 
 class MiniK3(nn.Module):
-    def __init__(self, d_model, n_head, d_head, d_k, d_v, d_c, d_latent, d_expert, d_shared, mix_ratio=4, layers=16, vocab_size=32_000, tie_embeddings=True, use_ckpt=False):
+    def __init__(self, d_model, n_head, d_head, d_k, d_v, d_c, d_latent, d_expert, d_shared, mix_ratio=4, layers=16, vocab_size=32_000, tie_embeddings=True, use_ckpt=False, attnres_block=6):
         super().__init__()
 
         self.layers = layers
         self.use_ckpt = use_ckpt
+        self.attnres_block = attnres_block  
         self.embedding = nn.Embedding(vocab_size, d_model)
 
         self.mixers = nn.ModuleList(
@@ -322,16 +329,23 @@ class MiniK3(nn.Module):
     def forward(self, idx, tgt=None):
         ckpt = (lambda f, t: checkpoint(f, t, use_reentrant=False)) if self.use_ckpt else (lambda f, t: f(t))
 
-        pool = [self.embedding(idx)]
+        S = self.attnres_block
+        blocks = [self.embedding(idx)]
+        partial, filled = None, 0
 
         for l in range(self.layers):
-            h = self.attn_res[2*l](pool)
-            pool.append(ckpt(lambda t, m=self.mixers[l], n=self.norm_mix[l]: m(n(t)), h))
+            for j, f in ((2*l,     lambda t, m=self.mixers[l], n=self.norm_mix[l]: m(n(t))),
+                         (2*l + 1, lambda t, m=self.moe[l],    n=self.norm_ff[l]:  m(n(t)))):
+                srcs = blocks if partial is None else blocks + [partial]
+                h = self.attn_res[j](srcs)
+                out = ckpt(f, h)
+                partial = out if partial is None else partial + out
+                filled += 1
+                if filled == S:
+                    blocks.append(partial)
+                    partial, filled = None, 0
 
-            h = self.attn_res[2*l + 1](pool)
-            pool.append(ckpt(lambda t, m=self.moe[l], n=self.norm_ff[l]: m(n(t)), h))
-
-        x = self.attn_res[-1](pool)
+        x = self.attn_res[-1](blocks if partial is None else blocks + [partial])
         x = self.norm_out(x)
 
         if tgt is None:

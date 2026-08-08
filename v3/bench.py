@@ -2,6 +2,8 @@ import time
 import torch
 from model import MiniK3
 
+from config import Config
+
 def benchmark(model, B, T, vocab, steps=10, warmup=3, bf16=True, compile_model=True,
               peak_tflops=71.0):
     """peak_tflops: 3090 bf16 tensor-core peak with fp32 accumulate is ~71 TFLOPS."""
@@ -20,12 +22,6 @@ def benchmark(model, B, T, vocab, steps=10, warmup=3, bf16=True, compile_model=T
         loss.backward()
         opt.step()
         opt.zero_grad(set_to_none=True)
-
-    '''
-    torch.cuda.memory._record_memory_history(max_entries=100_000)
-    step()
-    torch.cuda.memory._dump_snapshot('snap.pickle')
-    '''
     
     for _ in range(warmup):
         step()
@@ -79,8 +75,24 @@ if __name__ == '__main__':
 
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
-    m = MiniK3(d_model=640, n_head=8, d_k=128, d_v=64, d_c=256, d_expert=512, d_latent=320, d_shared=1024,
-           d_head=128, layers=12, vocab_size=16000).cuda()
+    cfg = Config()
 
-    r = benchmark(m, B=22, T=1024, vocab=16000, compile_model=True)
+    m = MiniK3(
+        d_model=cfg.d_model, 
+        n_head=cfg.n_head, 
+        d_k=cfg.d_k, 
+        d_v=cfg.d_v, 
+        d_c=cfg.d_c, 
+        d_expert=cfg.d_expert, 
+        d_latent=cfg.d_latent, 
+        d_shared=cfg.d_shared,
+        d_head=cfg.d_head, 
+        mix_ratio=cfg.mix_ratio,
+        layers=cfg.layers, 
+        vocab_size=cfg.vocab_size,
+        tie_embeddings=cfg.tie_embeddings,
+        use_ckpt=cfg.use_ckpt
+    ).cuda()
+
+    r = benchmark(m, B=1, T=16384, vocab=16000, compile_model=True)
     project(r['tok_s'], r['n_active'])
